@@ -43,7 +43,7 @@ Fuzz Kubernetes API endpoints using custom dictionaries. Find hidden, legacy, or
 
 **Run:**  
 ```sh
-kube_fuzzer --dictionary endpoints.txt --config ~/.kube/config
+./kubefuzzer <file-with-relative-endpoint-urls>
 ```
 
 ---
