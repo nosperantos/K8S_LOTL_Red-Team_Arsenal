@@ -70,8 +70,10 @@ bash token_monster.sh
 
 ## 📝 References
 
+- [Cloud hacking encyclopedia](https://cloud.hacktricks.wiki/en/pentesting-cloud/kubernetes-security/index.html)
 - [Kubernetes Docs](https://kubernetes.io/docs/)
 - [OWASP K8S Top 10](https://owasp.org/www-project-kubernetes-top-10/)
+- [Target Practice with Kubernetes-Goat](https://madhuakula.com/kubernetes-goat/)
 
 ---
 
