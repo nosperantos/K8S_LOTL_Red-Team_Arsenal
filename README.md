@@ -1,6 +1,6 @@
 # K8S_LOTL_Red-Team_Arsenal
 
-> 🩸 Useful tools for Red Teams operating "Living Off The Land" in Kubernetes & cloud-native environments  
+> Useful tools for Red Teams operating "Living Off The Land" in Kubernetes & cloud-native environments  
 > _blend, evade, enumerate – like a real adversary._  
 
 ---
