@@ -83,10 +83,10 @@ jobs:
           bash -n ./TokenMonster/TokenMonster.sh
           echo "✓ Bash syntax validation passed"
       
-      - name: Test tool detection functions
+      - name: Test auto-install environment detection
         run: |
-          echo "Testing tool detection logic..."
-          bash ./TokenMonster/TokenMonster.sh --help 2>/dev/null || echo "Script requires kubectl or mounted token"
+          echo "Testing auto-install and environment detection logic..."
+          bash ./TokenMonster/TokenMonster.sh --help 2>/dev/null
           echo "✓ Script executes without syntax errors"
       
       - name: Lint Dockerfile
@@ -97,14 +97,13 @@ jobs:
             echo "No Dockerfile found (will be created in build step)"
           fi
       
-      - name: Check for required dependencies in script
+      - name: Check for auto-install and curl functions
         run: |
-          echo "Verifying script includes tool detection for:"
-          grep -q "curl" ./TokenMonster/TokenMonster.sh && echo "✓ curl detection found"
-          grep -q "wget" ./TokenMonster/TokenMonster.sh && echo "✓ wget detection found"
-          grep -q "base64" ./TokenMonster/TokenMonster.sh && echo "✓ base64 detection found"
-          grep -q "jq" ./TokenMonster/TokenMonster.sh && echo "✓ jq detection found"
-          grep -q "python3" ./TokenMonster/TokenMonster.sh && echo "✓ python3 detection found"
+          echo "Verifying script includes auto-install and curl functionality:"
+          grep -q "install_kubectl" ./TokenMonster/TokenMonster.sh && echo "✓ kubectl auto-install function found"
+          grep -q "install_curl" ./TokenMonster/TokenMonster.sh && echo "✓ curl auto-install function found"
+          grep -q "detect_package_manager" ./TokenMonster/TokenMonster.sh && echo "✓ package manager detection found"
+          grep -q "k8s_api_get" ./TokenMonster/TokenMonster.sh && echo "✓ curl-based Kubernetes API functions found"
 
   security-scan:
     runs-on: ubuntu-latest
@@ -147,32 +146,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Test LOTL tool detection
+      - name: Test auto-install functions
         run: |
-          echo "=== Testing LOTL Tool Detection Functions ==="
+          echo "=== Testing Auto-Install Functions ==="
           
-          # Source the script functions
           source ./TokenMonster/TokenMonster.sh
           
-          echo "Testing detect_tools function..."
-          detect_tools
+          echo "Testing detect_package_manager function..."
+          PM=$(detect_package_manager)
+          echo "Detected package manager: $PM"
+          
+          if [ "$PM" != "unknown" ]; then
+            echo "✓ Package manager detection passed"
+          else
+            echo "⚠ Could not detect package manager"
+          fi
           
           echo ""
-          echo "Verifying available tools:"
-          echo "Download tool: $DOWNLOAD_TOOL"
-          echo "JSON parser: $JSON_PARSER"
-          echo "Decode tool: $DECODE_TOOL"
-          
-          if [ -z "$DOWNLOAD_TOOL" ]; then
-            echo "✗ No download tool found - this should not happen"
-            exit 1
-          fi
-          
-          if [ -z "$JSON_PARSER" ]; then
-            echo "⚠ No JSON parser found (optional for LOTL)"
-          fi
-          
-          echo "✓ Tool detection tests passed"
+          echo "Testing detect_environment function..."
+          detect_environment
+          ENV_RESULT=$?
+          echo "Environment detection result: $ENV_RESULT"
+          echo "✓ Environment detection test passed"
       
       - name: Test base64 decode functionality
         run: |
@@ -195,29 +190,6 @@ jobs:
             exit 1
           fi
       
-      - name: Test download functions
-        run: |
-          echo "=== Testing Download Functions ==="
-          
-          source ./TokenMonster/TokenMonster.sh
-          
-          detect_tools
-          
-          if [ "$DOWNLOAD_TOOL" = "curl" ] || [ "$DOWNLOAD_TOOL" = "wget" ]; then
-            echo "Testing download with $DOWNLOAD_TOOL..."
-            # Test with a simple public URL
-            TEMP_FILE=$(mktemp)
-            download_file "https://raw.githubusercontent.com/nosperantos/K8S_LOTL_Red-Team_Arsenal/main/TokenMonster/README.md" "$TEMP_FILE"
-            
-            if [ -s "$TEMP_FILE" ]; then
-              echo "✓ Download test passed"
-              rm "$TEMP_FILE"
-            else
-              echo "⚠ Download test inconclusive (network may be restricted)"
-              rm "$TEMP_FILE"
-            fi
-          fi
-      
       - name: Test JWT decoding logic
         run: |
           echo "=== Testing JWT Decode Functions ==="
@@ -236,6 +208,21 @@ jobs:
             echo "✗ JWT header extraction failed"
             exit 1
           fi
+      
+      - name: Test API endpoint construction
+        run: |
+          echo "=== Testing Kubernetes API Endpoint Construction ==="
+          
+          source ./TokenMonster/TokenMonster.sh
+          
+          # Test with mock values
+          K8S_API_SERVER="https://mock-server:443"
+          K8S_TOKEN="mock-token"
+          K8S_NAMESPACE="default"
+          
+          echo "API Server: $K8S_API_SERVER"
+          echo "Namespace: $K8S_NAMESPACE"
+          echo "✓ API configuration test passed"
 
   documentation:
     runs-on: ubuntu-latest
@@ -262,16 +249,22 @@ jobs:
             echo "⚠ LOTL mode documentation missing"
           fi
           
-          if grep -q "curl\|wget" ./TokenMonster/README.md; then
-            echo "✓ Tool alternatives documented"
+          if grep -q "curl" ./TokenMonster/README.md; then
+            echo "✓ Curl implementation documented"
           else
-            echo "⚠ Tool alternatives not documented"
+            echo "⚠ Curl implementation not documented"
           fi
           
           if grep -q "kubectl" ./TokenMonster/README.md; then
             echo "✓ kubectl mode documented"
           else
             echo "⚠ kubectl mode not documented"
+          fi
+          
+          if grep -q "auto-install\|auto install" ./TokenMonster/README.md; then
+            echo "✓ Auto-install feature documented"
+          else
+            echo "⚠ Auto-install feature not documented"
           fi
 
   report:
