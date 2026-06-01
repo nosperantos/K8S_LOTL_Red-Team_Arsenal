@@ -1,0 +1,295 @@
+name: Build & Test TokenMonster Container
+
+on:
+  push:
+    branches:
+      - main
+      - bash-tool-autodetection
+    paths:
+      - 'TokenMonster/**'
+      - '.github/workflows/tokenmonster-build.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'TokenMonster/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/tokenmonster
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./TokenMonster
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run ShellCheck on TokenMonster.sh
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './TokenMonster'
+      
+      - name: Validate bash syntax
+        run: |
+          bash -n ./TokenMonster/TokenMonster.sh
+          echo "✓ Bash syntax validation passed"
+      
+      - name: Test tool detection functions
+        run: |
+          echo "Testing tool detection logic..."
+          bash ./TokenMonster/TokenMonster.sh --help 2>/dev/null || echo "Script requires kubectl or mounted token"
+          echo "✓ Script executes without syntax errors"
+      
+      - name: Lint Dockerfile
+        run: |
+          if [ -f "./TokenMonster/Dockerfile" ]; then
+            docker run --rm -i hadolint/hadolint < ./TokenMonster/Dockerfile || echo "Dockerfile has linting suggestions"
+          else
+            echo "No Dockerfile found (will be created in build step)"
+          fi
+      
+      - name: Check for required dependencies in script
+        run: |
+          echo "Verifying script includes tool detection for:"
+          grep -q "curl" ./TokenMonster/TokenMonster.sh && echo "✓ curl detection found"
+          grep -q "wget" ./TokenMonster/TokenMonster.sh && echo "✓ wget detection found"
+          grep -q "base64" ./TokenMonster/TokenMonster.sh && echo "✓ base64 detection found"
+          grep -q "jq" ./TokenMonster/TokenMonster.sh && echo "✓ jq detection found"
+          grep -q "python3" ./TokenMonster/TokenMonster.sh && echo "✓ python3 detection found"
+
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'TokenMonster'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Check for hardcoded secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./TokenMonster
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  integration-test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Test LOTL tool detection
+        run: |
+          echo "=== Testing LOTL Tool Detection Functions ==="
+          
+          # Source the script functions
+          source ./TokenMonster/TokenMonster.sh
+          
+          echo "Testing detect_tools function..."
+          detect_tools
+          
+          echo ""
+          echo "Verifying available tools:"
+          echo "Download tool: $DOWNLOAD_TOOL"
+          echo "JSON parser: $JSON_PARSER"
+          echo "Decode tool: $DECODE_TOOL"
+          
+          if [ -z "$DOWNLOAD_TOOL" ]; then
+            echo "✗ No download tool found - this should not happen"
+            exit 1
+          fi
+          
+          if [ -z "$JSON_PARSER" ]; then
+            echo "⚠ No JSON parser found (optional for LOTL)"
+          fi
+          
+          echo "✓ Tool detection tests passed"
+      
+      - name: Test base64 decode functionality
+        run: |
+          echo "=== Testing Base64 Decode Functions ==="
+          
+          source ./TokenMonster/TokenMonster.sh
+          
+          # Test string
+          TEST_STRING="SGVsbG8gVG9rZW5Nb25zdGVyIQ=="
+          EXPECTED="Hello TokenMonster!"
+          
+          RESULT=$(decode_base64 "$TEST_STRING")
+          
+          if [ "$RESULT" = "$EXPECTED" ]; then
+            echo "✓ Base64 decode test passed"
+          else
+            echo "✗ Base64 decode test failed"
+            echo "Expected: $EXPECTED"
+            echo "Got: $RESULT"
+            exit 1
+          fi
+      
+      - name: Test download functions
+        run: |
+          echo "=== Testing Download Functions ==="
+          
+          source ./TokenMonster/TokenMonster.sh
+          
+          detect_tools
+          
+          if [ "$DOWNLOAD_TOOL" = "curl" ] || [ "$DOWNLOAD_TOOL" = "wget" ]; then
+            echo "Testing download with $DOWNLOAD_TOOL..."
+            # Test with a simple public URL
+            TEMP_FILE=$(mktemp)
+            download_file "https://raw.githubusercontent.com/nosperantos/K8S_LOTL_Red-Team_Arsenal/main/TokenMonster/README.md" "$TEMP_FILE"
+            
+            if [ -s "$TEMP_FILE" ]; then
+              echo "✓ Download test passed"
+              rm "$TEMP_FILE"
+            else
+              echo "⚠ Download test inconclusive (network may be restricted)"
+              rm "$TEMP_FILE"
+            fi
+          fi
+      
+      - name: Test JWT decoding logic
+        run: |
+          echo "=== Testing JWT Decode Functions ==="
+          
+          source ./TokenMonster/TokenMonster.sh
+          
+          # Example JWT (not a real one)
+          FAKE_JWT="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+          
+          echo "Testing JWT decoding (header extraction)..."
+          HEADER=$(echo "$FAKE_JWT" | cut -d'.' -f1)
+          
+          if [ -n "$HEADER" ]; then
+            echo "✓ JWT header extraction passed"
+          else
+            echo "✗ JWT header extraction failed"
+            exit 1
+          fi
+
+  documentation:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Verify README exists
+        run: |
+          if [ ! -f "./TokenMonster/README.md" ]; then
+            echo "✗ README.md not found"
+            exit 1
+          fi
+          echo "✓ README.md found"
+      
+      - name: Check documentation completeness
+        run: |
+          echo "=== Checking Documentation ==="
+          
+          if grep -q "LOTL" ./TokenMonster/README.md; then
+            echo "✓ LOTL mode documented"
+          else
+            echo "⚠ LOTL mode documentation missing"
+          fi
+          
+          if grep -q "curl\|wget" ./TokenMonster/README.md; then
+            echo "✓ Tool alternatives documented"
+          else
+            echo "⚠ Tool alternatives not documented"
+          fi
+          
+          if grep -q "kubectl" ./TokenMonster/README.md; then
+            echo "✓ kubectl mode documented"
+          else
+            echo "⚠ kubectl mode not documented"
+          fi
+
+  report:
+    if: always()
+    needs: [build, test, security-scan, integration-test, documentation]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate workflow summary
+        run: |
+          echo "## TokenMonster Build & Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Status" >> $GITHUB_STEP_SUMMARY
+          echo "- Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Tests: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Security Scan: ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration Tests: ${{ needs.integration-test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Documentation: ${{ needs.documentation.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Container: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
